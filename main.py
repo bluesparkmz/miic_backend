@@ -168,6 +168,18 @@ def get_current_user_profile(current_user: User = Depends(get_current_admin_user
     return current_user
 
 
+@app.get("/api/admin/users", response_model=List[UserResponse], tags=["Admin Management"])
+def list_admin_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin_user)
+):
+    """
+    List all administrator accounts.
+    Protected: requires admin authentication.
+    """
+    return db.query(User).order_by(User.created_at.desc()).all()
+
+
 @app.post("/api/admin/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED, tags=["Admin Management"])
 def create_admin_user(
     user_in: UserCreate,
@@ -176,19 +188,23 @@ def create_admin_user(
 ):
     """
     Creates a new admin user (only existing authenticated admins can perform this).
+    Requires username, email, and password.
     """
     existing_user = db.query(User).filter(
-        or_(User.username == user_in.username, User.email == user_in.email)
+        or_(
+            User.username == user_in.username.strip(),
+            User.email == user_in.email.strip().lower()
+        )
     ).first()
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User with this username or email already exists.",
+            detail="Já existe um administrador com este nome de utilizador ou email.",
         )
 
     new_admin = User(
-        username=user_in.username,
-        email=user_in.email,
+        username=user_in.username.strip(),
+        email=user_in.email.strip().lower(),
         hashed_password=get_password_hash(user_in.password),
         is_admin=True,
     )
@@ -196,6 +212,46 @@ def create_admin_user(
     db.commit()
     db.refresh(new_admin)
     return new_admin
+
+
+@app.delete("/api/admin/users/{id}", tags=["Admin Management"])
+def delete_admin_user(
+    id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin_user)
+):
+    """
+    Deletes an administrator account.
+    Protected: cannot delete your own account, cannot delete the last remaining admin.
+    """
+    if current_user.id == id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Não é possível eliminar a sua própria conta de administrador.",
+        )
+
+    user = db.query(User).filter(User.id == id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Administrador com ID #{id} não foi encontrado.",
+        )
+
+    admin_count = db.query(User).filter(User.is_admin == True).count()
+    if admin_count <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Não é possível eliminar o único administrador do sistema.",
+        )
+
+    deleted_username = user.username
+    db.delete(user)
+    db.commit()
+    return {
+        "success": True,
+        "message": f"Administrador '{deleted_username}' (ID #{id}) foi eliminado com sucesso.",
+        "id": id,
+    }
 
 
 # ==========================================
