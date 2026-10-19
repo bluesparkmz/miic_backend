@@ -1,5 +1,6 @@
 import io
 import csv
+from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Query, status
@@ -8,6 +9,11 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
+
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 from database import engine, Base, get_db
 from models import User, Registration
@@ -403,34 +409,69 @@ def get_dashboard_stats(
     }
 
 
+PROFILE_LABELS = {
+    "0": "Investidor",
+    "1": "Empresa",
+    "2": "Governo / Instituição",
+    "3": "Imprensa / Média",
+    "4": "Outro",
+}
+
+STATUS_LABELS = {
+    "pending": "Pendente",
+    "confirmed": "Confirmada",
+    "cancelled": "Cancelada",
+}
+
+
 @app.get("/api/registrations/export/csv", tags=["Analytics (Admin)"])
 @app.get("/api/inscricoes/export/csv", include_in_schema=False)
 def export_registrations_csv(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    search: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_admin: User = Depends(get_current_admin_user)
 ):
     """
-    Export all event registrations as a downloadable CSV file.
+    Export event registrations as a downloadable CSV file (with UTF-8 BOM for Microsoft Excel).
     Protected: requires admin authentication.
     """
-    registrations = db.query(Registration).order_by(Registration.created_at.desc()).all()
+    query = db.query(Registration)
+    if status_filter and status_filter != "all":
+        query = query.filter(Registration.status == status_filter)
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(
+            or_(
+                Registration.full_name.ilike(search_term),
+                Registration.email.ilike(search_term),
+                Registration.organization.ilike(search_term),
+                Registration.country.ilike(search_term),
+            )
+        )
+
+    registrations = query.order_by(Registration.created_at.desc()).all()
 
     output = io.StringIO()
+    # Write UTF-8 BOM for Microsoft Excel compatibility
+    output.write("\ufeff")
     writer = csv.writer(output, delimiter=";")
     writer.writerow([
         "ID",
-        "Full Name",
+        "Nome Completo",
         "Email",
-        "Phone",
-        "Organization",
-        "Country",
-        "Participant Type",
-        "Message",
+        "Telefone",
+        "Organização",
+        "País",
+        "Perfil",
+        "Mensagem / Foco",
         "Status",
-        "Registration Date"
+        "Data de Inscrição"
     ])
 
     for reg in registrations:
+        profile_label = PROFILE_LABELS.get(reg.participant_type, reg.participant_type or "Outro")
+        status_label = STATUS_LABELS.get(reg.status, reg.status)
         writer.writerow([
             reg.id,
             reg.full_name,
@@ -438,15 +479,132 @@ def export_registrations_csv(
             reg.phone or "",
             reg.organization or "",
             reg.country,
-            reg.participant_type,
+            profile_label,
             (reg.message or "").replace("\n", " "),
-            reg.status,
-            reg.created_at.strftime("%Y-%m-%d %H:%M:%S") if reg.created_at else ""
+            status_label,
+            reg.created_at.strftime("%d/%m/%Y %H:%M") if reg.created_at else ""
         ])
 
-    output.seek(0)
+    csv_bytes = output.getvalue().encode("utf-8-sig")
     return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=miic_2026_registrations.csv"}
+        io.BytesIO(csv_bytes),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=inscricoes_miic_2026.csv"}
+    )
+
+
+@app.get("/api/registrations/export/pdf", tags=["Analytics (Admin)"])
+@app.get("/api/inscricoes/export/pdf", include_in_schema=False)
+def export_registrations_pdf(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    search: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin_user)
+):
+    """
+    Export event registrations as a formatted PDF report.
+    Protected: requires admin authentication.
+    """
+    query = db.query(Registration)
+    if status_filter and status_filter != "all":
+        query = query.filter(Registration.status == status_filter)
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(
+            or_(
+                Registration.full_name.ilike(search_term),
+                Registration.email.ilike(search_term),
+                Registration.organization.ilike(search_term),
+                Registration.country.ilike(search_term),
+            )
+        )
+
+    registrations = query.order_by(Registration.created_at.desc()).all()
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=25,
+        rightMargin=25,
+        topMargin=25,
+        bottomMargin=25
+    )
+    styles = getSampleStyleSheet()
+    elements = []
+
+    title_style = ParagraphStyle(
+        'DocTitle',
+        parent=styles['Heading1'],
+        fontName='Helvetica-Bold',
+        fontSize=16,
+        leading=20,
+        textColor=colors.HexColor('#0B1E3B')
+    )
+    subtitle_style = ParagraphStyle(
+        'DocSub',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor('#4B5563')
+    )
+
+    now_str = datetime.now().strftime("%d/%m/%Y às %H:%M")
+    filter_label = f"Filtro: {status_filter}" if status_filter and status_filter != "all" else "Todas as Inscrições"
+    elements.append(Paragraph("MIIC 2026 — Mozambique International Investment Congress", title_style))
+    elements.append(Paragraph(f"Relatório Oficial de Inscrições | {filter_label} | Emitido em: {now_str} | Total: {len(registrations)} participantes", subtitle_style))
+    elements.append(Spacer(1, 12))
+
+    headers = ["#", "Nome Completo", "Email", "Telefone", "Organização", "País", "Perfil", "Status", "Data"]
+    table_data = [headers]
+
+    cell_style = ParagraphStyle(
+        'CellText',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=8,
+        leading=10,
+    )
+
+    for reg in registrations:
+        profile_label = PROFILE_LABELS.get(reg.participant_type, reg.participant_type or "Outro")
+        status_label = STATUS_LABELS.get(reg.status, reg.status)
+        created_str = reg.created_at.strftime("%d/%m/%Y") if reg.created_at else ""
+        table_data.append([
+            str(reg.id),
+            Paragraph(reg.full_name[:35], cell_style),
+            Paragraph(reg.email[:35], cell_style),
+            reg.phone or "-",
+            Paragraph((reg.organization or "-")[:28], cell_style),
+            reg.country[:22],
+            profile_label,
+            status_label,
+            created_str,
+        ])
+
+    col_widths = [25, 120, 140, 85, 120, 85, 95, 70, 60]
+    t = Table(table_data, colWidths=col_widths, repeatRows=1)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0B1E3B')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+        ('TOPPADDING', (0, 0), (-1, 0), 6),
+        ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F9FAFB')]),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E5E7EB')),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 4),
+        ('TOPPADDING', (0, 1), (-1, -1), 4),
+    ]))
+    elements.append(t)
+    doc.build(elements)
+
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=inscricoes_miic_2026.pdf"}
     )
